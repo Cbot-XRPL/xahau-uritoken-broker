@@ -34,12 +34,50 @@ broker account for operator recovery. Treat the broker as an intermediary you mo
 
 ## Install parameters
 
-Set when the hook is installed (see `scripts/install.js`):
+Set when the hook is installed (see `scripts/install.js`). **Always send the full set** - the first install of a
+given wasm hash stores its parameters on the hook *definition* as defaults, and later installs of the same hash
+inherit whatever they leave out.
 
-| Param    | Type          | Meaning                                              |
-|----------|---------------|------------------------------------------------------|
-| `FEEDEST`| ascii r-addr  | wallet that receives the broker fee (required)       |
-| `FEEBPS` | uint32        | fee in basis points, `0..10000` (e.g. `250` = 2.5%)  |
+| Param    | Type          | Meaning                                                                                  |
+|----------|---------------|------------------------------------------------------------------------------------------|
+| `FEEDEST`| ascii r-addr  | wallet that receives the broker fee (required)                                           |
+| `FEEBPS` | uint32        | fee in basis points, `0..10000` (e.g. `250` = 2.5%)                                      |
+| `RSVINC` | uint32 drops  | **v2** - the ledger's owner-reserve increment (mainnet + testnet: `200000` = 0.2 XAH). See below. |
+| `FEEMIN` | uint64 drops  | **v2** - optional minimum fee per sale; `0` = off. Fee = `max(ask * FEEBPS / 10000, FEEMIN)`. |
+
+## Fee accounting (v2) - why `RSVINC` exists
+
+When the hook `Remit`s the bought token to the buyer, Xahau makes the **sender** (the broker) transfer the
+buyer's owner-reserve increment for the new URIToken object - 0.2 XAH on mainnet - along with the token. v1 only
+netted the three emitted-transaction fees out of the fee payout, so **every sale silently cost the broker 0.2 XAH**
+(a reference deployment lost ~100 XAH over ~500 sales before this was caught).
+
+v2 counts `RSVINC` as a chain cost at the remit step, so:
+
+```
+payout to FEEDEST = gross fee - URITokenBuy fee - Remit fee - RSVINC - payout tx fee
+```
+
+and the broker ends every sale at **exactly** the balance it started with. If the gross fee is smaller than those
+costs (tiny asks), no payout is emitted and the broker absorbs the difference - at 2.5% that happens below an ask
+of roughly 12 XAH. Set `FEEMIN` to stop subsidising tiny sales; your buy-tx builder must then use the same floor,
+because the hook rejects any payment that is not exactly `ask + fee`.
+
+The installer checks `RSVINC` against the live ledger's `reserve_inc` and refuses a mismatch. If the network ever
+changes its reserve, re-install with the new value.
+
+## Topping up the broker
+
+The hook rolls back every incoming `Payment` that lacks `NFTID` + `BUY`, so a plain transfer to the broker
+**fails**. It accepts any non-Payment transaction, so fund it with a native-XAH **`Remit`**:
+
+```bash
+BROKER=rYourBroker... FUND_SEED=s... AMOUNT=100 node scripts/fund.js --network mainnet          # dry run
+BROKER=rYourBroker... FUND_SEED=s... AMOUNT=100 node scripts/fund.js --network mainnet --apply
+```
+
+The broker needs working XAH for the emitted `URITokenBuy` / `Remit` / fee legs and the reserve transfer; the
+hook rejects a sale up front if the broker cannot cover the ask, all three fees and `RSVINC`.
 
 ## Build
 
@@ -71,7 +109,19 @@ FEEDEST=rYourFeeWallet... BROKER_SEED=s... node scripts/install.js --network mai
 ```
 
 `--network testnet` targets Xahau testnet. The installer refuses to run if the broker already carries a hook
-(it expects a clean account) and caps the SetHook fee at 20 XAH.
+(it expects a clean account) and caps the SetHook fee at 20 XAH. SetHook fee quotes can spike transiently under
+load (a 500x quote was seen once, normal a minute later) - the cap catches it; just re-run.
+
+### Upgrading a live broker (v1 -> v2)
+
+```bash
+FEEDEST=r... BROKER_SEED=s... node scripts/install.js --network mainnet --upgrade          # dry run
+FEEDEST=r... BROKER_SEED=s... node scripts/install.js --network mainnet --upgrade --apply
+```
+
+`--upgrade` replaces the hook in place (same slot, same namespace, `hsfOVERRIDE`, no namespace delete) so any
+pending-sale state survives, but it **refuses while a pending sale record exists** in the namespace - wait for the
+in-flight sale to finish and re-run. Use the same `NAMESPACE` label as the original install.
 
 ### Keep the seed off any server
 
@@ -85,13 +135,25 @@ Keep `BROKER_SEED` / `config/broker.json` out of git (already in `.gitignore`).
 src/broker.c        the hook source (C)
 build/broker.wasm   prebuilt binary (rebuild with `npm run build`)
 scripts/build.js    compile via the Xahau buildbox
-scripts/install.js  install on a dedicated broker account (mainnet/testnet)
+scripts/install.js  install on a dedicated broker account (mainnet/testnet); --upgrade replaces a live hook
+scripts/fund.js     top up the broker's working XAH by Remit (plain Payments are rejected by the hook)
 ```
+
+## Versions
+
+| Version | HookHash (sha512half) | Size | Notes |
+|---|---|---|---|
+| **v2** (current) | `EF0C87237993204F414122828C308F4C332B158973C1108D99C3C0645E37C917` | 15,042 B | `RSVINC` netted out of the payout (zero balance drift per sale), optional `FEEMIN` floor. Testnet-proven 30/30 (normal sale, sub-cost sale, floor reject + accept, namespace clean). Live on the reference deployment since 2026-09-20. |
+| v1 | `2E418F951A9202B4E8EB589D605873A14514121455CF7090F697D42E1EE5D8D4` | 14,390 B | Original port. Bleeds 0.2 XAH per sale (remit reserve not recouped). |
+
+The prebuilt `build/broker.wasm` is v2; `npm run build` reproduces the same hash from `src/broker.c` on the
+buildbox. Verify: `node -e "const c=require('crypto'),fs=require('fs');console.log(c.createHash('sha512').update(fs.readFileSync('build/broker.wasm')).digest('hex').slice(0,64).toUpperCase())"`.
 
 ## Provenance
 
 Derived from the "Ephemeral Broker Hook" reference in the Xahau hooks toolkit example set. A reference
-deployment runs on Xahau mainnet as the marketplace broker for the Odin's Eyes raven-license NFT.
+deployment runs on Xahau mainnet as the marketplace broker for the Odin's Eyes raven-license NFT
+(`rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg`, v2 `EF0C8723`).
 
 ## License
 

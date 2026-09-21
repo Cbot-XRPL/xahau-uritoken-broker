@@ -8,11 +8,19 @@
  *                   (Alternatively put {"seed":"s...","address":"r..."} in config/broker.json.)
  *   FEEDEST       — r-address that receives the broker fee. REQUIRED.
  *   FEEBPS        — fee in basis points, 0..10000 (default 250 = 2.5%).
+ *   RSVINC        — v2: the ledger's owner-reserve increment in drops (default 200000 = 0.2 XAH). The Remit that
+ *                   delivers the token transfers this much to the buyer; the hook nets it out of the fee payout.
+ *                   Checked against the live ledger's reserve_inc at install time.
+ *   FEEMIN        — v2: optional minimum broker fee per sale in drops (default 0 = off). When set, the buyer's
+ *                   payment must equal ask + max(ask*FEEBPS/10000, FEEMIN); your buy-tx builder must match.
  *   NAMESPACE     — label hashed to the hook namespace (default "uritoken-broker"; any value works, it only
  *                   isolates this account's hook state).
  *
  *   node scripts/install.js --network mainnet            # DRY RUN (prints, signs nothing)
  *   node scripts/install.js --network mainnet --apply    # sign SetHook from the broker + submit
+ *   node scripts/install.js --network mainnet --upgrade --apply
+ *       # replace the hook on a broker that ALREADY runs one (same slot + namespace, hsfOVERRIDE, no NSDELETE:
+ *       # pending-sale state survives). Refuses while any pending sale record exists in the namespace.
  *
  * Fund the broker with ~5 XAH first. Run this locally — it signs with the broker seed; a public server should
  * never hold this seed (the hook signs its own emitted txns on-chain, the server just reads state).
@@ -20,6 +28,7 @@
 const fs = require("fs"), path = require("path"), crypto = require("crypto"), xrpl = require("@transia/xrpl");
 const ROOT = path.resolve(__dirname, "..");
 const APPLY = process.argv.includes("--apply");
+const UPGRADE = process.argv.includes("--upgrade");
 const NET = (process.argv.includes("--network") ? process.argv[process.argv.indexOf("--network") + 1] : "mainnet").toLowerCase();
 const NETS = { mainnet: { ws: "wss://xahau.org", id: 21337 }, testnet: { ws: "wss://xahau-test.net", id: 21338 } };
 if (!NETS[NET]) { console.error("--network must be mainnet | testnet"); process.exit(1); }
@@ -28,6 +37,7 @@ const FEE_CAP = 20_000_000;   // 20 XAH guard
 
 const HE = (s) => Buffer.from(s, "ascii").toString("hex").toUpperCase();
 const u32 = (n) => (Number(n) >>> 0).toString(16).padStart(8, "0").toUpperCase();
+const u64 = (n) => BigInt(n).toString(16).padStart(16, "0").toUpperCase();
 const P = (n, v) => ({ HookParameter: { HookParameterName: HE(n), HookParameterValue: v } });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -56,15 +66,21 @@ async function pollTx(c, h, lls) { const s = Date.now(); while (Date.now() - s <
   const FEEBPS = Number(process.env.FEEBPS || 250);
   if (!/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(FEEDEST)) { console.error("set FEEDEST to a valid r-address (the fee wallet)"); process.exit(1); }
   if (!(FEEBPS >= 0 && FEEBPS <= 10000)) { console.error("FEEBPS out of range (0..10000)"); process.exit(1); }
+  const RSVINC = Number(process.env.RSVINC || 200000);
+  const FEEMIN = Number(process.env.FEEMIN || 0);
+  if (!(RSVINC > 0 && RSVINC < 4294967296)) { console.error("RSVINC out of range (drops, uint32)"); process.exit(1); }
+  if (!(FEEMIN >= 0)) { console.error("FEEMIN must be >= 0 (drops)"); process.exit(1); }
 
   const wasm = fs.readFileSync(path.join(ROOT, "build", "broker.wasm"));
   const hash = crypto.createHash("sha512").update(wasm).digest("hex").slice(0, 64).toUpperCase();
-  const params = [P("FEEDEST", HE(FEEDEST)), P("FEEBPS", u32(FEEBPS))];
+  // ALWAYS send the full parameter set: the first install of a given wasm hash stores its params on the hook
+  // DEFINITION as defaults, and later installs of the same hash inherit anything they leave out.
+  const params = [P("FEEDEST", HE(FEEDEST)), P("FEEBPS", u32(FEEBPS)), P("RSVINC", u32(RSVINC)), P("FEEMIN", u64(FEEMIN))];
 
-  console.log(`\n── broker install (${NET}) ──`);
+  console.log(`\n── broker ${UPGRADE ? "UPGRADE" : "install"} (${NET}) ──`);
   console.log(`broker   : ${BROKER}`);
   console.log(`hook     : ${hash.slice(0, 8)} (${wasm.length} B)  ns "${NS_LABEL}" ${NS.slice(0, 12)}…`);
-  console.log(`fee      : ${FEEBPS} bps (${FEEBPS / 100}%) → ${FEEDEST}`);
+  console.log(`fee      : ${FEEBPS} bps (${FEEBPS / 100}%) → ${FEEDEST}   RSVINC ${RSVINC} drops   FEEMIN ${FEEMIN} drops${FEEMIN ? "" : " (off)"}`);
 
   const c = new xrpl.Client(WS); c.apiVersion = 1; await c.connect();
   try {
@@ -72,9 +88,22 @@ async function pollTx(c, h, lls) { const s = Date.now(); while (Date.now() - s <
     try { acct = await c.request({ command: "account_info", account: BROKER, ledger_index: "validated" }); }
     catch { console.error(`\n✗ ${BROKER} is not funded. Send it ~5 XAH, then re-run.`); await c.disconnect(); process.exit(1); }
     console.log(`balance  : ${Number(acct.result.account_data.Balance) / 1e6} XAH`);
+    const srv = (await c.request({ command: "server_info" })).result.info.validated_ledger;
+    const liveRsv = Math.round(Number(srv.reserve_inc_xrp) * 1e6);
+    if (liveRsv !== RSVINC) { console.error(`\n✗ ledger reserve_inc is ${liveRsv} drops but RSVINC=${RSVINC} — set RSVINC=${liveRsv} (the hook nets exactly this out of each payout).`); await c.disconnect(); process.exit(1); }
     const existing = await c.request({ command: "account_objects", account: BROKER, type: "hook", ledger_index: "validated" });
     const slots = existing.result.account_objects?.[0]?.Hooks || [];
-    if (slots.some((h) => h.Hook?.HookHash)) { console.error("\n✗ broker already runs a hook — ABORT (expected a fresh, dedicated account)."); await c.disconnect(); process.exit(1); }
+    const live = slots.map((h) => (h.Hook?.HookHash || "").slice(0, 8)).filter(Boolean);
+    if (!UPGRADE && live.length) { console.error(`\n✗ broker already runs a hook [${live}] — ABORT (expected a fresh, dedicated account; use --upgrade to replace it).`); await c.disconnect(); process.exit(1); }
+    if (UPGRADE) {
+      if (live.length !== 1) { console.error(`\n✗ --upgrade expects exactly one live hook, found [${live}]`); await c.disconnect(); process.exit(1); }
+      if (live[0] === hash.slice(0, 8)) { console.error(`\n✗ broker already runs ${live[0]} — nothing to upgrade`); await c.disconnect(); process.exit(1); }
+      let pending = [];
+      try { pending = (await c.request({ command: "account_namespace", account: BROKER, namespace_id: NS, ledger_index: "validated" })).result.namespace_entries || []; }
+      catch (e) { if (!/not found/i.test(String(e.message || e.data?.error_message || e.data?.error))) throw e; }
+      console.log(`live     : [${live}] → ${hash.slice(0, 8)}   pending sale records: ${pending.length}`);
+      if (pending.length) { console.error("\n✗ a sale is mid-flight (pending record in the namespace) — wait a minute and re-run."); await c.disconnect(); process.exit(1); }
+    }
 
     const tx = { TransactionType: "SetHook", Account: BROKER, Flags: 0, NetworkID: NETID,
       Hooks: [{ Hook: { CreateCode: wasm.toString("hex").toUpperCase(), HookOn: HOOK_ON, HookNamespace: NS, HookApiVersion: 0, Flags: 1, HookParameters: params } }] };
@@ -94,7 +123,7 @@ async function pollTx(c, h, lls) { const s = Date.now(); while (Date.now() - s <
     if (res === "tesSUCCESS") {
       const after = await c.request({ command: "account_objects", account: BROKER, type: "hook", ledger_index: "validated" });
       const h2 = (after.result.account_objects?.[0]?.Hooks || []).map((h) => (h.Hook?.HookHash || "").slice(0, 8));
-      console.log(`✓ installed. broker hooks now: [${h2.join(", ")}]`);
+      console.log(`✓ ${UPGRADE ? "upgraded" : "installed"}. broker hooks now: [${h2.join(", ")}]`);
       console.log(`\nbroker account : ${BROKER}\nhook hash      : ${hash.slice(0, 8)}\nBuyers pay this account with tx params NFTID + BUY (see README).`);
     }
   } finally { try { await c.disconnect(); } catch {} }

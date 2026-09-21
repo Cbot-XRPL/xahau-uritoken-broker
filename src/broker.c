@@ -16,6 +16,11 @@
  * - install params:
  *   - FEEDEST : ascii r-address for the Vault fee wallet (required when FEEBPS > 0)
  *   - FEEBPS  : 4-byte uint32 fee basis points, 0..10000
+ *   - RSVINC  : 4-byte uint32 drops - the ledger's owner-reserve increment the Remit transfers to the buyer
+ *               for the URIToken it delivers (v2; 0/absent = default 200000 = 0.2 XAH). Counted as a chain
+ *               cost so the fee payout nets it out and the broker stops bleeding 0.2 XAH per sale.
+ *   - FEEMIN  : 8-byte uint64 drops - optional minimum broker fee per sale (v2; 0/absent = off). When set,
+ *               fee = max(ask * FEEBPS / 10000, FEEMIN); the server's buy builder must use the same floor.
  *
  * Runtime behavior:
  * 1. Read the live URIToken object for NFTID.
@@ -65,6 +70,7 @@
 #define EB_DISALLOW_INCOMING_REMIT_FLAG 0x80000000UL
 
 #define EB_MAX_FEE_BPS 10000U
+#define EB_DEFAULT_RSV_INC 200000ULL
 
 #define EB_EMIT_DETAILS_LEN 138U
 
@@ -180,6 +186,24 @@ int64_t hook(uint32_t reserved)
     if (fee_bps > EB_MAX_FEE_BPS)
         EB_ROLLBACK("ephemeral_broker_hook: FEEBPS must be 0..10000.");
 
+    /* v2: reserve the Remit will hand the buyer (optional param, zeroed buffer, default 0.2 XAH) */
+    uint8_t rsv_buf[4];
+    EB_ZERO(rsv_buf, 4);
+    uint8_t rsv_key[] = {'R', 'S', 'V', 'I', 'N', 'C'};
+    uint64_t rsv_inc = 0;
+    if (hook_param(SBUF(rsv_buf), SBUF(rsv_key)) == 4)
+        rsv_inc = UINT32_FROM_BUF(rsv_buf);
+    if (rsv_inc == 0)
+        rsv_inc = EB_DEFAULT_RSV_INC;
+
+    /* v2: optional minimum fee per sale (zeroed buffer, 0 = off) */
+    uint8_t fee_min_buf[8];
+    EB_ZERO(fee_min_buf, 8);
+    uint8_t fee_min_key[] = {'F', 'E', 'E', 'M', 'I', 'N'};
+    uint64_t fee_min = 0;
+    if (hook_param(SBUF(fee_min_buf), SBUF(fee_min_key)) == 8)
+        fee_min = UINT64_FROM_BUF(fee_min_buf);
+
     uint8_t fee_wallet_acc[20];
     EB_ZERO(fee_wallet_acc, 20);
     if (fee_bps > 0)
@@ -282,6 +306,8 @@ int64_t hook(uint32_t reserved)
         if (fee_drops_signed < 0)
             EB_ROLLBACK("ephemeral_broker_hook: fee amount conversion failed.");
         fee_drops = (uint64_t)fee_drops_signed;
+        if (fee_drops < fee_min)
+            fee_drops = fee_min;
     }
 
     if (fee_drops > 0 && (uint64_t)ask_drops > (~(uint64_t)0) - fee_drops)
@@ -424,6 +450,9 @@ int64_t hook(uint32_t reserved)
     if (success_required_spend > (~(uint64_t)0) - (uint64_t)remit_fee)
         EB_ROLLBACK("ephemeral_broker_hook: projected remit spend overflow.");
     success_required_spend += (uint64_t)remit_fee;
+    if (success_required_spend > (~(uint64_t)0) - rsv_inc)
+        EB_ROLLBACK("ephemeral_broker_hook: projected reserve spend overflow.");
+    success_required_spend += rsv_inc;
 
     if (projected_balance_after_payment < success_required_spend)
         EB_ROLLBACK("ephemeral_broker_hook: broker needs more XAH headroom to finish buy and remit.");
@@ -640,14 +669,26 @@ int64_t cbak(uint32_t ctx)
         }
         EB_WRITE_DROPS(remit_txn + EB_REMIT_FEE_OUT, (uint64_t)remit_fee);
 
+        /* v2: the Remit also transfers the buyer's URIToken owner-reserve (RSVINC, default 0.2 XAH) out of the
+         * broker - count it as a chain cost so the fee payout nets it out instead of bleeding it every sale. */
+        uint8_t cb_rsv_buf[4];
+        EB_ZERO(cb_rsv_buf, 4);
+        uint8_t cb_rsv_key[] = {'R', 'S', 'V', 'I', 'N', 'C'};
+        uint64_t cb_rsv_inc = 0;
+        if (hook_param(SBUF(cb_rsv_buf), SBUF(cb_rsv_key)) == 4)
+            cb_rsv_inc = UINT32_FROM_BUF(cb_rsv_buf);
+        if (cb_rsv_inc == 0)
+            cb_rsv_inc = EB_DEFAULT_RSV_INC;
+        uint64_t remit_cost = (uint64_t)remit_fee + cb_rsv_inc;
+
         uint64_t chain_fees_paid = EB_READ_PENDING_U64(pending, EB_REC_CHAIN_FEES);
-        if (chain_fees_paid > (~(uint64_t)0) - (uint64_t)remit_fee)
+        if (chain_fees_paid > (~(uint64_t)0) - remit_cost)
         {
             pending[EB_REC_PHASE] = EB_PHASE_REMIT_FAILED_STUCK;
             state_set(SBUF(pending), SBUF(callback_key));
             EB_ACCEPT("ephemeral_broker_hook: remit fee tracking overflow.");
         }
-        EB_WRITE_PENDING_U64(pending, EB_REC_CHAIN_FEES, chain_fees_paid + (uint64_t)remit_fee);
+        EB_WRITE_PENDING_U64(pending, EB_REC_CHAIN_FEES, chain_fees_paid + remit_cost);
 
         uint8_t remit_hash[32];
         if (emit(SBUF(remit_hash), SBUF(remit_txn)) < 0)
