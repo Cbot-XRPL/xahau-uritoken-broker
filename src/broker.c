@@ -21,6 +21,10 @@
  *               cost so the fee payout nets it out and the broker stops bleeding 0.2 XAH per sale.
  *   - FEEMIN  : 8-byte uint64 drops - optional minimum broker fee per sale (v2; 0/absent = off). When set,
  *               fee = max(ask * FEEBPS / 10000, FEEMIN); the server's buy builder must use the same floor.
+ *   - MEMO    : 2..64 ascii bytes - optional memo stamped on the emitted URITokenBuy (what the seller sees) and
+ *               the Remit that delivers the token (what the buyer sees), as Memos[{MemoData, MemoFormat
+ *               "text/plain"}] (v3). A 0/1-byte value (e.g. "-") = no memo. Set it explicitly at install: the
+ *               first install of a wasm hash stores its params as the DEFINITION defaults for everyone.
  *
  * Runtime behavior:
  * 1. Read the live URIToken object for NFTID.
@@ -100,8 +104,51 @@
 #define EB_REMIT_ACCOUNT_OUT 71U
 #define EB_REMIT_DEST_OUT 93U
 #define EB_REMIT_EMIT_OUT 113U
-#define EB_REMIT_URITOKEN_FIELD_OUT 251U
+#define EB_REMIT_URITOKEN_FIELD_OUT 251U   /* base offset; shifts right by the memo block when MEMO is set */
 #define EB_REMIT_URITOKEN_ID_OUT 255U
+
+/* v3 memo: Memos(F9) [ Memo(EA) MemoData(7D len data) MemoFormat(7E 0A "text/plain") E1 ] F1 = 18 + len bytes.
+ * Canonical order: after EmitDetails (type 14), before URITokenIDs (type 19). */
+#define EB_MEMO_MAX 64U
+#define EB_MEMO_BLOCK_MAX (18U + EB_MEMO_MAX)
+#define EB_MEMO_BLOCK_LEN(mlen) ((mlen) ? (18U + (uint32_t)(mlen)) : 0U)
+#define EB_WRITE_MEMO(buf, off, memo, mlen)                                                    \
+    {                                                                                          \
+        if ((mlen) > 0)                                                                        \
+        {                                                                                      \
+            uint32_t eb_o = (uint32_t)(off);                                                   \
+            (buf)[eb_o + 0] = 0xF9U;                                                           \
+            (buf)[eb_o + 1] = 0xEAU;                                                           \
+            (buf)[eb_o + 2] = 0x7DU;                                                           \
+            (buf)[eb_o + 3] = (uint8_t)(mlen);                                                 \
+            for (uint32_t eb_i = 0; EB_GUARD(EB_MEMO_MAX), eb_i < (uint32_t)(mlen); ++eb_i)    \
+                (buf)[eb_o + 4 + eb_i] = (memo)[eb_i];                                         \
+            eb_o += 4U + (uint32_t)(mlen);                                                     \
+            (buf)[eb_o + 0] = 0x7EU;                                                           \
+            (buf)[eb_o + 1] = 0x0AU;                                                           \
+            (buf)[eb_o + 2] = 't';                                                             \
+            (buf)[eb_o + 3] = 'e';                                                             \
+            (buf)[eb_o + 4] = 'x';                                                             \
+            (buf)[eb_o + 5] = 't';                                                             \
+            (buf)[eb_o + 6] = '/';                                                             \
+            (buf)[eb_o + 7] = 'p';                                                             \
+            (buf)[eb_o + 8] = 'l';                                                             \
+            (buf)[eb_o + 9] = 'a';                                                             \
+            (buf)[eb_o + 10] = 'i';                                                            \
+            (buf)[eb_o + 11] = 'n';                                                            \
+            (buf)[eb_o + 12] = 0xE1U;                                                          \
+            (buf)[eb_o + 13] = 0xF1U;                                                          \
+        }                                                                                      \
+    }
+/* read the optional MEMO param into a zeroed 64-byte buffer; len 0 unless 2..64 bytes and non-blank */
+#define EB_READ_MEMO(memo, mlen)                                                               \
+    {                                                                                          \
+        uint8_t eb_memo_key[] = {'M', 'E', 'M', 'O'};                                          \
+        int64_t eb_ml = hook_param(SBUF(memo), SBUF(eb_memo_key));                             \
+        (mlen) = 0U;                                                                           \
+        if (eb_ml >= 2 && eb_ml <= (int64_t)EB_MEMO_MAX && (memo)[0] != 0)                     \
+            (mlen) = (uint32_t)eb_ml;                                                          \
+    }
 
 #define EB_ZERO(buf, len)                             \
     {                                                \
@@ -203,6 +250,13 @@ int64_t hook(uint32_t reserved)
     uint64_t fee_min = 0;
     if (hook_param(SBUF(fee_min_buf), SBUF(fee_min_key)) == 8)
         fee_min = UINT64_FROM_BUF(fee_min_buf);
+
+    /* v3: optional memo for the buy + remit legs */
+    uint8_t memo[EB_MEMO_MAX];
+    EB_ZERO(memo, EB_MEMO_MAX);
+    uint32_t memo_len = 0;
+    EB_READ_MEMO(memo, memo_len);
+    uint32_t memo_block = EB_MEMO_BLOCK_LEN(memo_len);
 
     uint8_t fee_wallet_acc[20];
     EB_ZERO(fee_wallet_acc, 20);
@@ -331,8 +385,9 @@ int64_t hook(uint32_t reserved)
     if (hook_balance_drops < 0)
         EB_ROLLBACK("ephemeral_broker_hook: invalid broker balance.");
 
-    uint8_t buy_txn[EB_BUY_TX_LEN];
-    EB_ZERO(buy_txn, EB_BUY_TX_LEN);
+    uint8_t buy_txn[EB_BUY_TX_LEN + EB_MEMO_BLOCK_MAX];
+    EB_ZERO(buy_txn, EB_BUY_TX_LEN + EB_MEMO_BLOCK_MAX);
+    uint32_t buy_len = EB_BUY_TX_LEN + memo_block;   /* Memos sit after EmitDetails = the tail of the buy tx */
     buy_txn[0] = 0x12U;
     buy_txn[1] = 0x00U;
     buy_txn[2] = 0x2FU;
@@ -364,7 +419,8 @@ int64_t hook(uint32_t reserved)
     EB_WRITE_DROPS(buy_txn + EB_BUY_FEE_OUT, 0U);
     if (etxn_details(buy_txn + EB_BUY_EMIT_OUT, EB_EMIT_DETAILS_LEN) != EB_EMIT_DETAILS_LEN)
         EB_ROLLBACK("ephemeral_broker_hook: emit details failed.");
-    int64_t buy_fee = etxn_fee_base(SBUF(buy_txn));
+    EB_WRITE_MEMO(buy_txn, EB_BUY_TX_LEN, memo, memo_len);
+    int64_t buy_fee = etxn_fee_base(buy_txn, buy_len);
     if (buy_fee < 0)
         EB_ROLLBACK("ephemeral_broker_hook: fee calc failed.");
     EB_WRITE_DROPS(buy_txn + EB_BUY_FEE_OUT, (uint64_t)buy_fee);
@@ -401,8 +457,10 @@ int64_t hook(uint32_t reserved)
     if (refund_fee < 0)
         EB_ROLLBACK("ephemeral_broker_hook: refund fee preflight failed.");
 
-    uint8_t remit_probe[EB_REMIT_TX_LEN];
-    EB_ZERO(remit_probe, EB_REMIT_TX_LEN);
+    uint8_t remit_probe[EB_REMIT_TX_LEN + EB_MEMO_BLOCK_MAX];
+    EB_ZERO(remit_probe, EB_REMIT_TX_LEN + EB_MEMO_BLOCK_MAX);
+    uint32_t remit_len = EB_REMIT_TX_LEN + memo_block;
+    uint32_t remit_uri_field = EB_REMIT_URITOKEN_FIELD_OUT + memo_block;   /* URITokenIDs follows the memo block */
     remit_probe[0] = 0x12U;
     remit_probe[1] = 0x00U;
     remit_probe[2] = 0x5FU;
@@ -420,19 +478,20 @@ int64_t hook(uint32_t reserved)
     remit_probe[70] = 0x14U;
     remit_probe[91] = 0x83U;
     remit_probe[92] = 0x14U;
-    remit_probe[EB_REMIT_URITOKEN_FIELD_OUT + 0] = 0x00U;
-    remit_probe[EB_REMIT_URITOKEN_FIELD_OUT + 1] = 0x13U;
-    remit_probe[EB_REMIT_URITOKEN_FIELD_OUT + 2] = 0x63U;
-    remit_probe[EB_REMIT_URITOKEN_FIELD_OUT + 3] = 0x20U;
+    remit_probe[remit_uri_field + 0] = 0x00U;
+    remit_probe[remit_uri_field + 1] = 0x13U;
+    remit_probe[remit_uri_field + 2] = 0x63U;
+    remit_probe[remit_uri_field + 3] = 0x20U;
     UINT32_TO_BUF(remit_probe + EB_REMIT_FLS_OUT, buy_fls);
     UINT32_TO_BUF(remit_probe + EB_REMIT_LLS_OUT, buy_fls + 4U);
     EB_COPY_20(remit_probe + EB_REMIT_ACCOUNT_OUT, hook_acc);
     EB_COPY_20(remit_probe + EB_REMIT_DEST_OUT, buyer_acc);
-    EB_COPY_32(remit_probe + EB_REMIT_URITOKEN_ID_OUT, nft_id);
+    EB_COPY_32(remit_probe + remit_uri_field + 4, nft_id);
     EB_WRITE_DROPS(remit_probe + EB_REMIT_FEE_OUT, 0U);
     if (etxn_details(remit_probe + EB_REMIT_EMIT_OUT, EB_EMIT_DETAILS_LEN) != EB_EMIT_DETAILS_LEN)
         EB_ROLLBACK("ephemeral_broker_hook: remit preflight emit details failed.");
-    int64_t remit_fee = etxn_fee_base(SBUF(remit_probe));
+    EB_WRITE_MEMO(remit_probe, EB_REMIT_URITOKEN_FIELD_OUT, memo, memo_len);
+    int64_t remit_fee = etxn_fee_base(remit_probe, remit_len);
     if (remit_fee < 0)
         EB_ROLLBACK("ephemeral_broker_hook: remit fee preflight failed.");
 
@@ -458,7 +517,7 @@ int64_t hook(uint32_t reserved)
         EB_ROLLBACK("ephemeral_broker_hook: broker needs more XAH headroom to finish buy and remit.");
 
     uint8_t buy_hash[32];
-    if (emit(SBUF(buy_hash), SBUF(buy_txn)) < 0)
+    if (emit(SBUF(buy_hash), buy_txn, buy_len) < 0)
         EB_ROLLBACK("ephemeral_broker_hook: URITokenBuy emit failed.");
 
     uint8_t pending[EB_PENDING_VALUE_LEN];
@@ -616,8 +675,17 @@ int64_t cbak(uint32_t ctx)
             EB_ACCEPT("ephemeral_broker_hook: refund emitted.");
         }
 
-        uint8_t remit_txn[EB_REMIT_TX_LEN];
-        EB_ZERO(remit_txn, EB_REMIT_TX_LEN);
+        /* v3: same optional memo as the buy leg (hook_param works in cbak) */
+        uint8_t cb_memo[EB_MEMO_MAX];
+        EB_ZERO(cb_memo, EB_MEMO_MAX);
+        uint32_t cb_memo_len = 0;
+        EB_READ_MEMO(cb_memo, cb_memo_len);
+        uint32_t cb_memo_block = EB_MEMO_BLOCK_LEN(cb_memo_len);
+        uint32_t cb_remit_len = EB_REMIT_TX_LEN + cb_memo_block;
+        uint32_t cb_uri_field = EB_REMIT_URITOKEN_FIELD_OUT + cb_memo_block;
+
+        uint8_t remit_txn[EB_REMIT_TX_LEN + EB_MEMO_BLOCK_MAX];
+        EB_ZERO(remit_txn, EB_REMIT_TX_LEN + EB_MEMO_BLOCK_MAX);
         remit_txn[0] = 0x12U;
         remit_txn[1] = 0x00U;
         remit_txn[2] = 0x5FU;
@@ -635,10 +703,10 @@ int64_t cbak(uint32_t ctx)
         remit_txn[70] = 0x14U;
         remit_txn[91] = 0x83U;
         remit_txn[92] = 0x14U;
-        remit_txn[EB_REMIT_URITOKEN_FIELD_OUT + 0] = 0x00U;
-        remit_txn[EB_REMIT_URITOKEN_FIELD_OUT + 1] = 0x13U;
-        remit_txn[EB_REMIT_URITOKEN_FIELD_OUT + 2] = 0x63U;
-        remit_txn[EB_REMIT_URITOKEN_FIELD_OUT + 3] = 0x20U;
+        remit_txn[cb_uri_field + 0] = 0x00U;
+        remit_txn[cb_uri_field + 1] = 0x13U;
+        remit_txn[cb_uri_field + 2] = 0x63U;
+        remit_txn[cb_uri_field + 3] = 0x20U;
 
         if (etxn_reserve(1) < 0)
         {
@@ -652,7 +720,7 @@ int64_t cbak(uint32_t ctx)
         UINT32_TO_BUF(remit_txn + EB_REMIT_LLS_OUT, remit_fls + 4U);
         EB_COPY_20(remit_txn + EB_REMIT_ACCOUNT_OUT, hook_acc);
         EB_COPY_20(remit_txn + EB_REMIT_DEST_OUT, pending + EB_REC_BUYER);
-        EB_COPY_32(remit_txn + EB_REMIT_URITOKEN_ID_OUT, pending + EB_REC_NFTID);
+        EB_COPY_32(remit_txn + cb_uri_field + 4, pending + EB_REC_NFTID);
         EB_WRITE_DROPS(remit_txn + EB_REMIT_FEE_OUT, 0U);
         if (etxn_details(remit_txn + EB_REMIT_EMIT_OUT, EB_EMIT_DETAILS_LEN) != EB_EMIT_DETAILS_LEN)
         {
@@ -660,7 +728,8 @@ int64_t cbak(uint32_t ctx)
             state_set(SBUF(pending), SBUF(callback_key));
             EB_ACCEPT("ephemeral_broker_hook: remit emit details failed.");
         }
-        int64_t remit_fee = etxn_fee_base(SBUF(remit_txn));
+        EB_WRITE_MEMO(remit_txn, EB_REMIT_URITOKEN_FIELD_OUT, cb_memo, cb_memo_len);
+        int64_t remit_fee = etxn_fee_base(remit_txn, cb_remit_len);
         if (remit_fee < 0)
         {
             pending[EB_REC_PHASE] = EB_PHASE_REMIT_FAILED_STUCK;
@@ -691,7 +760,7 @@ int64_t cbak(uint32_t ctx)
         EB_WRITE_PENDING_U64(pending, EB_REC_CHAIN_FEES, chain_fees_paid + remit_cost);
 
         uint8_t remit_hash[32];
-        if (emit(SBUF(remit_hash), SBUF(remit_txn)) < 0)
+        if (emit(SBUF(remit_hash), remit_txn, cb_remit_len) < 0)
         {
             pending[EB_REC_PHASE] = EB_PHASE_REMIT_FAILED_STUCK;
             state_set(SBUF(pending), SBUF(callback_key));

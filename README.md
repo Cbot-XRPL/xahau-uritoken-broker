@@ -44,6 +44,23 @@ inherit whatever they leave out.
 | `FEEBPS` | uint32        | fee in basis points, `0..10000` (e.g. `250` = 2.5%)                                      |
 | `RSVINC` | uint32 drops  | **v2** - the ledger's owner-reserve increment (mainnet + testnet: `200000` = 0.2 XAH). See below. |
 | `FEEMIN` | uint64 drops  | **v2** - optional minimum fee per sale; `0` = off. Fee = `max(ask * FEEBPS / 10000, FEEMIN)`. |
+| `MEMO`   | 2..64 ascii   | **v3** - optional memo stamped on the emitted `URITokenBuy` and `Remit` (see below). `-` = off. |
+
+## Memo on the brokered legs (v3)
+
+With `MEMO` set, the hook appends a `Memos` field to the two transactions your counterparties actually see: the
+emitted `URITokenBuy` (the seller's wallet shows the broker buying their token) and the `Remit` that delivers the
+token (the buyer's wallet shows it arriving). Both carry one memo: `MemoData` = your text, `MemoFormat` =
+`text/plain`. The fee payout and any refund carry no memo.
+
+```bash
+MEMO="NFT brokered by My Marketplace" FEEDEST=r... BROKER_SEED=s... node scripts/install.js --network mainnet --apply
+```
+
+Leave `MEMO` unset (the installer sends `-`) for no memo. It is sent explicitly on purpose: the first install of a
+given wasm hash on a network stores its parameters as the hook *definition's* defaults, so a later install that
+omitted `MEMO` would inherit whatever the first installer chose. The reference deployment uses
+`NFT brokered by Xahau Vault`.
 
 ## Fee accounting (v2) - why `RSVINC` exists
 
@@ -112,7 +129,7 @@ FEEDEST=rYourFeeWallet... BROKER_SEED=s... node scripts/install.js --network mai
 (it expects a clean account) and caps the SetHook fee at 20 XAH. SetHook fee quotes can spike transiently under
 load (a 500x quote was seen once, normal a minute later) - the cap catches it; just re-run.
 
-### Upgrading a live broker (v1 -> v2)
+### Upgrading a live broker (e.g. v2 -> v3)
 
 ```bash
 FEEDEST=r... BROKER_SEED=s... node scripts/install.js --network mainnet --upgrade          # dry run
@@ -143,17 +160,18 @@ scripts/fund.js     top up the broker's working XAH by Remit (plain Payments are
 
 | Version | HookHash (sha512half) | Size | Notes |
 |---|---|---|---|
-| **v2** (current) | `EF0C87237993204F414122828C308F4C332B158973C1108D99C3C0645E37C917` | 15,042 B | `RSVINC` netted out of the payout (zero balance drift per sale), optional `FEEMIN` floor. Testnet-proven 30/30 (normal sale, sub-cost sale, floor reject + accept, namespace clean). Live on the reference deployment since 2026-09-20. |
+| **v3** (current) | `9D39BF3DF8A48960B73D00FA8D08246C6A53866B4C04BD0E3519264158C92CE0` | 15,765 B | + `MEMO` install param: text/plain Memo on the emitted `URITokenBuy` and `Remit` (not on the fee payout). Fee accounting unchanged from v2. |
+| v2 | `EF0C87237993204F414122828C308F4C332B158973C1108D99C3C0645E37C917` | 15,042 B | `RSVINC` netted out of the payout (zero balance drift per sale), optional `FEEMIN` floor. Testnet-proven 30/30 (normal sale, sub-cost sale, floor reject + accept, namespace clean). Live on the reference deployment 2026-09-20. |
 | v1 | `2E418F951A9202B4E8EB589D605873A14514121455CF7090F697D42E1EE5D8D4` | 14,390 B | Original port. Bleeds 0.2 XAH per sale (remit reserve not recouped). |
 
-The prebuilt `build/broker.wasm` is v2; `npm run build` reproduces the same hash from `src/broker.c` on the
+The prebuilt `build/broker.wasm` is v3; `npm run build` reproduces the same hash from `src/broker.c` on the
 buildbox. Verify: `node -e "const c=require('crypto'),fs=require('fs');console.log(c.createHash('sha512').update(fs.readFileSync('build/broker.wasm')).digest('hex').slice(0,64).toUpperCase())"`.
 
 ## Provenance
 
 Derived from the "Ephemeral Broker Hook" reference in the Xahau hooks toolkit example set. A reference
 deployment runs on Xahau mainnet as the marketplace broker for the Odin's Eyes raven-license NFT
-(`rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg`, v2 `EF0C8723`).
+(`rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg`, v3 `9D39BF3D`).
 
 ## License
 

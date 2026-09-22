@@ -13,6 +13,9 @@
  *                   Checked against the live ledger's reserve_inc at install time.
  *   FEEMIN        — v2: optional minimum broker fee per sale in drops (default 0 = off). When set, the buyer's
  *                   payment must equal ask + max(ask*FEEBPS/10000, FEEMIN); your buy-tx builder must match.
+ *   MEMO          — v3: 2..64 chars stamped as a text/plain Memo on the emitted URITokenBuy (seller sees it) and
+ *                   the Remit that delivers the token (buyer sees it). Default "-" = no memo. Always sent
+ *                   explicitly, because a wasm hash's first install sets the definition defaults for everyone.
  *   NAMESPACE     — label hashed to the hook namespace (default "uritoken-broker"; any value works, it only
  *                   isolates this account's hook state).
  *
@@ -68,19 +71,22 @@ async function pollTx(c, h, lls) { const s = Date.now(); while (Date.now() - s <
   if (!(FEEBPS >= 0 && FEEBPS <= 10000)) { console.error("FEEBPS out of range (0..10000)"); process.exit(1); }
   const RSVINC = Number(process.env.RSVINC || 200000);
   const FEEMIN = Number(process.env.FEEMIN || 0);
+  const MEMO = String(process.env.MEMO || "-");   // v3: "-" (default) = no memo
   if (!(RSVINC > 0 && RSVINC < 4294967296)) { console.error("RSVINC out of range (drops, uint32)"); process.exit(1); }
   if (!(FEEMIN >= 0)) { console.error("FEEMIN must be >= 0 (drops)"); process.exit(1); }
+  if (Buffer.byteLength(MEMO) > 64) { console.error("MEMO must be at most 64 bytes"); process.exit(1); }
 
   const wasm = fs.readFileSync(path.join(ROOT, "build", "broker.wasm"));
   const hash = crypto.createHash("sha512").update(wasm).digest("hex").slice(0, 64).toUpperCase();
   // ALWAYS send the full parameter set: the first install of a given wasm hash stores its params on the hook
   // DEFINITION as defaults, and later installs of the same hash inherit anything they leave out.
-  const params = [P("FEEDEST", HE(FEEDEST)), P("FEEBPS", u32(FEEBPS)), P("RSVINC", u32(RSVINC)), P("FEEMIN", u64(FEEMIN))];
+  const params = [P("FEEDEST", HE(FEEDEST)), P("FEEBPS", u32(FEEBPS)), P("RSVINC", u32(RSVINC)), P("FEEMIN", u64(FEEMIN)), P("MEMO", HE(MEMO))];
 
   console.log(`\n── broker ${UPGRADE ? "UPGRADE" : "install"} (${NET}) ──`);
   console.log(`broker   : ${BROKER}`);
   console.log(`hook     : ${hash.slice(0, 8)} (${wasm.length} B)  ns "${NS_LABEL}" ${NS.slice(0, 12)}…`);
   console.log(`fee      : ${FEEBPS} bps (${FEEBPS / 100}%) → ${FEEDEST}   RSVINC ${RSVINC} drops   FEEMIN ${FEEMIN} drops${FEEMIN ? "" : " (off)"}`);
+  console.log(`memo     : ${MEMO.length > 1 ? `"${MEMO}"` : "(off)"}`);
 
   const c = new xrpl.Client(WS); c.apiVersion = 1; await c.connect();
   try {
